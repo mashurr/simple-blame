@@ -2,7 +2,7 @@
     "name": "simple-blame",
     "displayName": "Simple Blame",
     "description": "A simple extension to toggle a whole-file Git blame view.",
-    "version": "0.0.2",
+    "version": "0.0.3",
     "publisher": "mashurr",
     "icon": "icon.png",
     "repository": {
@@ -10,7 +10,7 @@
       "url": "https://github.com/mashurr/simple-blame.git"
     },
     "engines": {
-        "vscode": "^1.102.0"
+        "vscode": "^1.90.0"
     },
     "categories": [
         "Other"
@@ -31,7 +31,7 @@
         "test": "vscode-test"
     },
     "devDependencies": {
-        "@types/vscode": "^1.102.0",
+        "@types/vscode": "^1.90.0",
         "@types/mocha": "^10.0.10",
         "@types/node": "20.x",
         "eslint": "^9.25.1",
