@@ -2,8 +2,9 @@
     "name": "simple-blame",
     "displayName": "Simple Blame",
     "description": "A simple extension to toggle a whole-file Git blame view.",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "publisher": "mashurr",
+    "icon": "icon.png",
     "repository": {
       "type": "git",
       "url": "https://github.com/mashurr/simple-blame.git"
