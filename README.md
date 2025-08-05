@@ -1,65 +1,56 @@
-# simple-blame README
+# Simple Blame
 
-This is the README for your extension "simple-blame". After writing up a brief description, we recommend including the following sections.
+A simple, lightweight VS Code extension to toggle a whole-file Git blame view directly in your editor. Instantly see who last edited every line of a file without leaving your code or needing a complex side panel.
+
+
+
+*(Image: Toggling blame on, hovering for details, and toggling off)*
 
 ## Features
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+Simple Blame is designed to be unobtrusive and easy to use.
 
-For example if there is an image subfolder under your extension project workspace:
+*   **Toggleable Blame View:** Turn the blame annotations on or off with a single click. You can use:
+    *   The **`Blame: ON/OFF`** button in the status bar.
+    *   The command palette (`Ctrl+Shift+P` or `Cmd+Shift+P`) and search for **"Simple Blame: Toggle Inline Blame"**.
 
-\!\[feature X\]\(images/feature-x.png\)
+*   **Inline Annotations:** When enabled, blame information is shown to the left of each line of code in a clean `[commit] [author] [date]` format.
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+*   **Detailed Hover Information:** Hover over any blame annotation to see the full commit details, including the complete commit message, author email, and full commit hash.
+
+*   **Automatic Updates:** The blame view automatically updates when you switch to a new file or save changes to the current file.
+
+*   **Lightweight:** The extension is activated on command and does nothing when the blame view is off, ensuring it uses zero resources in the background.
 
 ## Requirements
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+For the extension to work, you must have the following:
+
+1.  **Git** installed on your system and available in your system's PATH.
+2.  The file you are viewing must be inside a **Git repository**.
+3.  The file must be **committed**. The extension cannot show blame information for new, uncommitted files.
 
 ## Extension Settings
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
-
-For example:
-
-This extension contributes the following settings:
-
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+This extension does not contribute any settings. It is configured entirely through the toggle command.
 
 ## Known Issues
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
+*   **Performance on very large files:** Running `git blame` on files with hundreds of thousands of lines may take a moment to process. The editor will remain responsive while the command runs in the background.
+*   **Binary files:** The extension is not designed to work on binary files and will not show blame information for them.
+
+Please report any other issues on the GitHub repository issues page.
 
 ## Release Notes
 
-Users appreciate release notes as you update your extension.
-
 ### 1.0.0
 
-Initial release of ...
-
-### 1.0.1
-
-Fixed issue #.
-
-### 1.1.0
-
-Added features X, Y, and Z.
+Initial release of Simple Blame.
+*   Added whole-file blame view.
+*   Added toggle command in the Command Palette.
+*   Added clickable status bar item to show state and toggle blame.
+*   Added detailed hover information for each line.
 
 ---
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code.  Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux)
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux)
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
 
 **Enjoy!**
