@@ -1,7 +1,7 @@
 {
   "name": "simple-blame",
-  "displayName": "simple-blame",
-  "description": "a simple git blame UI in vscode",
+  "displayName": "Simple Blame",
+  "description": "A simple extension to toggle a whole-file Git blame view.",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.102.0"
@@ -10,12 +10,14 @@
     "Other"
   ],
   "activationEvents": [],
-  "main": "./extension.js",
+  "main": "./src/extension.js",
   "contributes": {
-    "commands": [{
-      "command": "simple-blame.helloWorld",
-      "title": "Hello World"
-    }]
+    "commands": [
+      {
+        "command": "simple-blame.toggle",
+        "title": "Simple Blame: Toggle Inline Blame"
+      }
+    ] 
   },
   "scripts": {
     "lint": "eslint .",
