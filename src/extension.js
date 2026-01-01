@@ -1,5 +1,5 @@
 const vscode = require('vscode');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const path = require('path');
 
 // --- Global State Variables ---
@@ -86,6 +86,24 @@ function clearAllDecorations() {
 }
 
 /**
+ * Resolves the git repository root for a file path.
+ * This is critical for submodules: the workspace root is not the right git root.
+ * @param {string} filePath Absolute file path.
+ * @param {(err: Error|null, gitRoot?: string) => void} cb Callback.
+ */
+function getGitRootForFile(filePath, cb) {
+    const fileDir = path.dirname(filePath);
+    execFile('git', ['rev-parse', '--show-toplevel'], { cwd: fileDir }, (error, stdout, stderr) => {
+        if (error) {
+            const msg = (stderr || error.message || '').toString().trim();
+            cb(new Error(msg || 'Not a git repository.'));
+            return;
+        }
+        cb(null, stdout.toString().trim());
+    });
+}
+
+/**
  * The core function to fetch and display blame for the ENTIRE file.
  * @param {vscode.TextEditor} editor The active text editor.
  */
@@ -97,31 +115,33 @@ function applyFullBlame(editor) {
     clearAllDecorations();
 
     const filePath = editor.document.uri.fsPath;
-    const workspaceFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
-    const cwd = workspaceFolder ? workspaceFolder.uri.fsPath : path.dirname(filePath);
-
-    const command = `git blame --porcelain -- "${filePath}"`;
-
-    // We are now about to run the git command.
-    // The code INSIDE this exec callback is what we need to check.
-    exec(command, { cwd }, (error, stdout, stderr) => {
-
-        if (error) {
-            vscode.window.showErrorMessage(`Blame failed: Is git installed and is this a git repository?`);
-            return;
-        }
-        if (stderr) {
-            vscode.window.showErrorMessage(`Blame failed: ${stderr}. Is the file committed?`);
+    getGitRootForFile(filePath, (rootErr, gitRoot) => {
+        if (rootErr || !gitRoot) {
+            vscode.window.showErrorMessage(`Blame failed: ${rootErr ? rootErr.message : 'Not a git repository.'}`);
             return;
         }
 
-
-        if (!isBlameActive || vscode.window.activeTextEditor !== editor) {
+        const relativePath = path.relative(gitRoot, filePath);
+        // If the file somehow resolves outside of the git root, bail out.
+        if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+            vscode.window.showErrorMessage(`Blame failed: File is outside the git repository root.`);
             return;
         }
 
-        const decorations = parseFullBlame(stdout, editor.document);
-        editor.setDecorations(blameDecorationType, decorations);
+        execFile('git', ['blame', '--porcelain', '--', relativePath], { cwd: gitRoot }, (error, stdout, stderr) => {
+            if (error) {
+                const msg = (stderr || error.message || '').toString().trim();
+                vscode.window.showErrorMessage(`Blame failed: ${msg || 'Unknown error.'} Is the file committed?`);
+                return;
+            }
+
+            if (!isBlameActive || vscode.window.activeTextEditor !== editor) {
+                return;
+            }
+
+            const decorations = parseFullBlame(stdout.toString(), editor.document);
+            editor.setDecorations(blameDecorationType, decorations);
+        });
     });
 }
 
