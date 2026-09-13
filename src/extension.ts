@@ -7,6 +7,8 @@ import * as path from 'path';
 const EDIT_DEBOUNCE_MS = 300;
 // git blame uses this hash for lines that are not committed yet
 const UNCOMMITTED_HASH = '0'.repeat(40);
+// Only full commit hashes are ever passed to git from hover actions
+const COMMIT_HASH = /^[0-9a-f]{40}$/;
 
 // Annotation columns, in characters, so the code after every annotation lines up
 const HASH_WIDTH = 8;
@@ -571,8 +573,13 @@ function commitHover(hash: string, commit: CommitDetails, now: number, folder: s
     // Only our own hover actions may run from links in this hover
     hoverMessage.isTrusted = { enabledCommands: [COPY_HASH_COMMAND, SHOW_DIFF_COMMAND] };
     hoverMessage.appendCodeblock(commit.summary || 'No commit message.', 'text');
-    hoverMessage.appendMarkdown(`\n\n**Commit:** ${hash}\n\n**Author:** ${commit.author} <${commit['author-mail']}>` +
-        `\n\n**Date:** ${formatDate(commit['author-time'])} ${formatTime(commit['author-time'])} (${formatAge(commit['author-time'], now)})`);
+    hoverMessage.appendMarkdown(`\n\n**Commit:** ${hash}\n\n**Author:** `);
+    // Author and email are chosen by whoever made the commit: add them as escaped text so they can't add links to this
+    // trusted hover, and drop angle brackets, which markdown would still turn into an autolink such as <command:...>
+    const author = commit.author.replace(/[<>]/g, '');
+    const email = commit['author-mail'].replace(/[<>]/g, '');
+    hoverMessage.appendText(email ? `${author} (${email})` : author);
+    hoverMessage.appendMarkdown(`\n\n**Date:** ${formatDate(commit['author-time'])} ${formatTime(commit['author-time'])} (${formatAge(commit['author-time'], now)})`);
 
     const actions = [`[$(copy) Copy hash](${commandUri(COPY_HASH_COMMAND, hash)})`];
     if (commit.filename) {
@@ -588,7 +595,7 @@ function commitHover(hash: string, commit: CommitDetails, now: number, folder: s
         actions.push(`[$(diff) Show diff](${commandUri(SHOW_DIFF_COMMAND, diff)})`);
     }
     if (webRepository) {
-        actions.push(`[$(link-external) Open on ${webRepository.name}](${webRepository.url}${webRepository.commitPath}${hash})`);
+        actions.push(`[$(link-external) Open on ${webRepository.name}](${markdownLinkTarget(`${webRepository.url}${webRepository.commitPath}${hash}`)})`);
     }
     hoverMessage.appendMarkdown(`\n\n${actions.join(' · ')}`);
     return hoverMessage;
@@ -629,16 +636,25 @@ function uncommittedHover(): vscode.MarkdownString {
  * @returns A markdown link target that runs the command.
  */
 function commandUri(command: string, ...args: unknown[]): string {
-    // encodeURIComponent leaves ( and ) alone, but a ) would end the markdown link early (e.g. a file named "a (1).txt")
-    const query = encodeURIComponent(JSON.stringify(args)).replace(/\(/g, '%28').replace(/\)/g, '%29');
-    return `command:${command}?${query}`;
+    return `command:${command}?${markdownLinkTarget(encodeURIComponent(JSON.stringify(args)))}`;
+}
+
+/**
+ * Escapes characters that would end or break a markdown link target.
+ * encodeURIComponent and remote URLs can still contain ( and ), and a ) would end the link early (e.g. a file named "a (1).txt").
+ */
+function markdownLinkTarget(target: string): string {
+    return target.replace(/[()\s<>]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`);
 }
 
 /**
  * Hover action: copies a commit hash to the clipboard.
  * @param hash Full commit hash.
  */
-async function copyCommitHash(hash: string) {
+async function copyCommitHash(hash: unknown) {
+    if (typeof hash !== 'string' || !COMMIT_HASH.test(hash)) {
+        return;
+    }
     await vscode.env.clipboard.writeText(hash);
     vscode.window.setStatusBarMessage(`$(check) Copied commit ${hash.substring(0, HASH_WIDTH)}`, 2000);
 }
@@ -646,11 +662,31 @@ async function copyCommitHash(hash: string) {
 /**
  * Hover action: shows what a commit changed in a file, as a diff of the file in the parent commit and in the commit.
  */
-async function showCommitDiff({ folder, hash, path: filePath, previousHash, previousPath }: CommitDiff) {
+async function showCommitDiff(diff: CommitDiff) {
+    // Arguments arrive through a command link, so check them before they reach git
+    if (!isValidDiff(diff)) {
+        return;
+    }
+    const { folder, hash, path: filePath, previousHash, previousPath } = diff;
     const before = revisionUri(folder, previousPath || filePath, previousHash);
     const after = revisionUri(folder, filePath, hash);
     const title = `${path.basename(filePath)} (${hash.substring(0, HASH_WIDTH)})`;
     await vscode.commands.executeCommand('vscode.diff', before, after, title);
+}
+
+/**
+ * Checks that Show diff arguments are well formed: absolute folder, full commit hashes, and paths.
+ */
+function isValidDiff(diff: unknown): diff is CommitDiff {
+    if (!diff || typeof diff !== 'object') {
+        return false;
+    }
+    const { folder, hash, path: filePath, previousHash, previousPath } = diff as Record<string, unknown>;
+    return typeof folder === 'string' && path.isAbsolute(folder)
+        && typeof hash === 'string' && COMMIT_HASH.test(hash)
+        && typeof filePath === 'string' && filePath.length > 0
+        && (previousHash === null || (typeof previousHash === 'string' && COMMIT_HASH.test(previousHash)))
+        && (previousPath === null || typeof previousPath === 'string');
 }
 
 /**
@@ -667,8 +703,9 @@ function revisionUri(folder: string, filePath: string, ref: string | null): vsco
  * @param uri A URI built by revisionUri().
  */
 function provideRevisionContent(uri: vscode.Uri): Promise<string> {
-    const { folder, ref } = JSON.parse(uri.query) as { folder: string; ref: string | null };
-    if (!ref) {
+    const { folder, ref } = JSON.parse(uri.query) as { folder: unknown; ref: unknown };
+    // No parent (the commit added the file), or anything that isn't a full commit hash: nothing to show
+    if (typeof ref !== 'string' || !COMMIT_HASH.test(ref) || typeof folder !== 'string') {
         return Promise.resolve('');
     }
     return new Promise(resolve => {
