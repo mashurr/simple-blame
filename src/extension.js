@@ -8,6 +8,15 @@ const EDIT_DEBOUNCE_MS = 300;
 // git blame uses this hash for lines that are not committed yet
 const UNCOMMITTED_HASH = '0'.repeat(40);
 
+// Annotation columns, in characters, so the code after every annotation lines up
+const HASH_WIDTH = 8;
+const MAX_AUTHOR_WIDTH = 20;
+const UNCOMMITTED_LABEL = 'uncommitted';
+const DATE_WIDTH = UNCOMMITTED_LABEL.length; // also fits YYYY-MM-DD
+// Columns are padded with non-breaking spaces; regular spaces collapse when rendered
+const NBSP = '\u00a0';
+const COLUMN_GAP = NBSP.repeat(2);
+
 // --- Global State Variables ---
 let blameDecorationType;
 let blameStatusBarItem;
@@ -271,84 +280,140 @@ function runGitBlame(filePath, contents, callback) {
 }
 
 /**
- * Parses the full --porcelain output from git blame for an entire file.
- * This version uses a cache to correctly handle multi-line commit groups.
+ * Parses the full --porcelain output from git blame into decorations for the document.
  * @param {string} blameOutput The raw string output from the git blame command.
  * @param {vscode.TextDocument} document The document to which the blame applies.
  * @returns {vscode.DecorationOptions[]} An array of DecorationOptions.
  */
 function parseFullBlame(blameOutput, document) {
-    const decorations = [];
-    const lines = blameOutput.split('\n');
+    return buildDecorations(parseBlameLines(blameOutput, document.lineCount), document);
+}
 
-    // Cache to store full metadata for each commit hash
-    const commitDataCache = new Map();
-    let currentCommitHash = null;
-    let currentLineNumber = -1;
+/**
+ * Reads porcelain output into one entry per blamed line.
+ * Commit details only appear the first time a commit is seen, so they are cached by hash.
+ * @param {string} blameOutput The raw string output from the git blame command.
+ * @param {number} lineCount Lines currently in the document; entries beyond it are dropped.
+ * @returns {{ lineNumber: number, hash: string, commit: Record<string, string> }[]}
+ */
+function parseBlameLines(blameOutput, lineCount) {
+    const entries = [];
+    const commits = new Map();
+    let hash = null;
+    let lineNumber = -1;
 
-    for (const line of lines) {
-        try {
-            if (line.startsWith('\t')) {
-                // This is the line of code. We must have seen its metadata already.
-                if (currentCommitHash === UNCOMMITTED_HASH && currentLineNumber >= 0 && currentLineNumber < document.lineCount) {
-                    // git reports lines that aren't committed yet with an all-zero hash and a placeholder author
-                    const hoverMessage = new vscode.MarkdownString('**Uncommitted changes**\n\nThis line has not been committed yet.');
-                    decorations.push({
-                        range: document.lineAt(currentLineNumber).range,
-                        renderOptions: { before: { contentText: 'You · uncommitted', color: new vscode.ThemeColor('disabledForeground') } },
-                        hoverMessage
-                    });
-                } else if (currentCommitHash && currentLineNumber >= 0 && currentLineNumber < document.lineCount) {
-                    const commitInfo = commitDataCache.get(currentCommitHash);
-
-                    // If we have valid, cached info for this commit, create the decoration
-                    if (commitInfo && commitInfo.author && commitInfo['author-time']) {
-                        const shortCommit = currentCommitHash.substring(0, 8);
-                        const author = commitInfo.author.trim();
-                        const date = new Date(parseInt(commitInfo['author-time']) * 1000);
-                        const formattedDate = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${date.getDate().toString().padStart(2, '0')}`;
-                        const contentText = `${shortCommit}  ${author}  ${formattedDate}`;
-
-                        const hoverMessage = new vscode.MarkdownString();
-                        hoverMessage.appendCodeblock(commitInfo.summary || 'No commit message.', 'text');
-                        hoverMessage.appendMarkdown(`\n\n**Commit:** ${currentCommitHash}\n\n**Author:** ${commitInfo.author} <${commitInfo['author-mail']}>`);
-
-                        const decoration = {
-                            range: document.lineAt(currentLineNumber).range,
-                            renderOptions: { before: { contentText } },
-                            hoverMessage: hoverMessage
-                        };
-                        decorations.push(decoration);
-                    }
-                }
-            } else {
-                // This is a metadata line.
-                const parts = line.split(' ');
-                if (parts.length > 1 && parts[0].length === 40) {
-                    // This is a new commit hash line.
-                    currentCommitHash = parts[0];
-                    currentLineNumber = parseInt(parts[2], 10) - 1;
-
-                    // If we haven't seen this commit before, create a placeholder in the cache.
-                    if (!commitDataCache.has(currentCommitHash)) {
-                        commitDataCache.set(currentCommitHash, {});
-                    }
-                } else if (currentCommitHash && parts.length > 1) {
-                    // This is other metadata (author, summary, etc.).
-                    // Add it to the cache for the current commit.
-                    const key = parts[0];
-                    const value = parts.slice(1).join(' ');
-                    const commitInfo = commitDataCache.get(currentCommitHash);
-                    if (commitInfo) {
-                        commitInfo[key] = value;
-                    }
-                }
+    for (const line of blameOutput.split('\n')) {
+        if (line.startsWith('\t')) {
+            // This is the line of code. Its commit header has already been read.
+            if (hash && lineNumber >= 0 && lineNumber < lineCount) {
+                entries.push({ lineNumber, hash, commit: commits.get(hash) });
             }
-        } catch (e) {
-            console.error(`[Simple Blame] PARSE CRASH: An unexpected error occurred. Error: ${e.message}`);
+            continue;
+        }
+
+        const parts = line.split(' ');
+        if (parts.length >= 3 && /^[0-9a-f]{40}$/.test(parts[0])) {
+            // Header line: <hash> <original line> <final line> [<lines in group>]
+            hash = parts[0];
+            lineNumber = parseInt(parts[2], 10) - 1;
+            if (!commits.has(hash)) {
+                commits.set(hash, {});
+            }
+        } else if (hash && parts.length > 1) {
+            // Commit details (author, author-time, summary, etc.)
+            commits.get(hash)[parts[0]] = parts.slice(1).join(' ');
         }
     }
-    return decorations;
+    return entries;
+}
+
+/**
+ * Builds a decoration for each blamed line. Every annotation is padded to the same width
+ * (hash, author, date columns) so the code after it stays aligned.
+ * @param {{ lineNumber: number, hash: string, commit: Record<string, string> }[]} entries
+ * @param {vscode.TextDocument} document
+ * @returns {vscode.DecorationOptions[]}
+ */
+function buildDecorations(entries, document) {
+    const blamed = entries.filter(entry => entry.hash === UNCOMMITTED_HASH || (entry.commit.author && entry.commit['author-time']));
+    const authorWidth = Math.min(MAX_AUTHOR_WIDTH, blamed.reduce((width, entry) => Math.max(width, charCount(authorOf(entry))), 0));
+    const hovers = new Map(); // one hover per commit instead of one per line
+
+    return blamed.map(entry => {
+        const uncommitted = entry.hash === UNCOMMITTED_HASH;
+        const contentText = [
+            padColumn(uncommitted ? '' : entry.hash.substring(0, HASH_WIDTH), HASH_WIDTH),
+            padColumn(authorOf(entry), authorWidth),
+            padColumn(uncommitted ? UNCOMMITTED_LABEL : formatDate(entry.commit['author-time']), DATE_WIDTH),
+        ].join(COLUMN_GAP);
+
+        if (!hovers.has(entry.hash)) {
+            hovers.set(entry.hash, uncommitted ? uncommittedHover() : commitHover(entry.hash, entry.commit));
+        }
+
+        return {
+            range: document.lineAt(entry.lineNumber).range,
+            renderOptions: {
+                // Uncommitted lines are dimmed so real commits stand out
+                before: uncommitted ? { contentText, color: new vscode.ThemeColor('disabledForeground') } : { contentText },
+            },
+            hoverMessage: hovers.get(entry.hash),
+        };
+    });
+}
+
+/**
+ * @param {{ hash: string, commit: Record<string, string> }} entry
+ * @returns {string} The name shown in the author column.
+ */
+function authorOf(entry) {
+    return entry.hash === UNCOMMITTED_HASH ? 'You' : entry.commit.author.trim();
+}
+
+/**
+ * Pads text with non-breaking spaces to exactly `width` characters, truncating with an ellipsis if needed.
+ * (Regular spaces would be collapsed when the annotation is rendered.)
+ * @param {string} text
+ * @param {number} width
+ */
+function padColumn(text, width) {
+    const chars = [...text];
+    if (chars.length > width) {
+        return chars.slice(0, width - 1).join('') + '…';
+    }
+    return text + NBSP.repeat(width - chars.length);
+}
+
+/**
+ * @param {string} text
+ * @returns {number} Number of characters (not UTF-16 code units).
+ */
+function charCount(text) {
+    return [...text].length;
+}
+
+/**
+ * @param {string} authorTime Unix timestamp in seconds.
+ * @returns {string} The date as YYYY-MM-DD.
+ */
+function formatDate(authorTime) {
+    const date = new Date(parseInt(authorTime, 10) * 1000);
+    return `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}-${date.getDate().toString().padStart(2, '0')}`;
+}
+
+/**
+ * @param {string} hash Full commit hash.
+ * @param {Record<string, string>} commit Commit details from the porcelain output.
+ */
+function commitHover(hash, commit) {
+    const hoverMessage = new vscode.MarkdownString();
+    hoverMessage.appendCodeblock(commit.summary || 'No commit message.', 'text');
+    hoverMessage.appendMarkdown(`\n\n**Commit:** ${hash}\n\n**Author:** ${commit.author} <${commit['author-mail']}>`);
+    return hoverMessage;
+}
+
+function uncommittedHover() {
+    return new vscode.MarkdownString('**Uncommitted changes**\n\nThis line has not been committed yet.');
 }
 
 function deactivate() {
