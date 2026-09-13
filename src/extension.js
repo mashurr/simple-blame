@@ -1,5 +1,5 @@
 const vscode = require('vscode');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const path = require('path');
 
 // --- Global State Variables ---
@@ -90,37 +90,29 @@ function clearAllDecorations() {
  * @param {vscode.TextEditor} editor The active text editor.
  */
 function applyFullBlame(editor) {
-    if (!editor || editor.document.isUntitled) {
+    // Only real files on disk can be blamed (skips untitled, output panels, diff views, etc.)
+    if (!editor || editor.document.uri.scheme !== 'file') {
         return;
     }
 
     clearAllDecorations();
 
     const filePath = editor.document.uri.fsPath;
-    const workspaceFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
-    const cwd = workspaceFolder ? workspaceFolder.uri.fsPath : path.dirname(filePath);
 
-    const command = `git blame --porcelain -- "${filePath}"`;
-
-    // We are now about to run the git command.
-    // The code INSIDE this exec callback is what we need to check.
-    exec(command, { cwd }, (error, stdout, stderr) => {
-
+    // Run git from the file's own directory so it resolves the nearest repository.
+    // This handles submodules and workspaces opened through symlinks.
+    execFile('git', ['blame', '--porcelain', '--', path.basename(filePath)], { cwd: path.dirname(filePath) }, (error, stdout, stderr) => {
         if (error) {
-            vscode.window.showErrorMessage(`Blame failed: Is git installed and is this a git repository?`);
+            const msg = (stderr || error.message || '').toString().trim();
+            vscode.window.showErrorMessage(`Blame failed: ${msg || 'Unknown error.'} Is the file committed?`);
             return;
         }
-        if (stderr) {
-            vscode.window.showErrorMessage(`Blame failed: ${stderr}. Is the file committed?`);
-            return;
-        }
-
 
         if (!isBlameActive || vscode.window.activeTextEditor !== editor) {
             return;
         }
 
-        const decorations = parseFullBlame(stdout, editor.document);
+        const decorations = parseFullBlame(stdout.toString(), editor.document);
         editor.setDecorations(blameDecorationType, decorations);
     });
 }
