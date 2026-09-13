@@ -36,6 +36,18 @@ const AGE_OPACITY = [
     [Infinity, 0.55], // still readable on light and high-contrast themes
 ];
 
+// Commands behind the hover's action links (not listed in the command palette)
+const COPY_HASH_COMMAND = 'simple-blame.copyCommitHash';
+const SHOW_DIFF_COMMAND = 'simple-blame.showCommitDiff';
+// Read-only documents with a file's contents at a commit, shown in the diff view
+const REVISION_SCHEME = 'simple-blame-revision';
+// Hosts with a web page per commit, matched against the remote's host name (so self-hosted GitHub/GitLab work too)
+const WEB_HOSTS = [
+    { match: 'github', name: 'GitHub', commitPath: '/commit/' },
+    { match: 'gitlab', name: 'GitLab', commitPath: '/-/commit/' },
+    { match: 'bitbucket', name: 'Bitbucket', commitPath: '/commits/' },
+];
+
 // --- Global State Variables ---
 let blameDecorationType;
 let blameStatusBarItem;
@@ -46,6 +58,7 @@ const latestBlameRequest = new Map(); // document -> id of its most recent blame
 const blameProblems = new Map(); // document -> why blame is unavailable, shown in the status bar
 let blameRequestCounter = 0;
 let gitMissingReported = false; // Only tell the user once that git is missing
+const remoteRepositories = new Map(); // folder -> promise of its web repository (or null), for "Open on GitHub" links
 
 function activate(context) {
     // 1. Create the Decoration Style
@@ -75,10 +88,18 @@ function activate(context) {
             cancelPendingBlames();
             clearAllDecorations();
             blameProblems.clear();
+            remoteRepositories.clear();
         }
         updateStatusBar();
     });
     context.subscriptions.push(toggleCommand);
+
+    // Hover actions: copy the commit hash, or show what the commit changed in the file
+    context.subscriptions.push(
+        vscode.commands.registerCommand(COPY_HASH_COMMAND, copyCommitHash),
+        vscode.commands.registerCommand(SHOW_DIFF_COMMAND, showCommitDiff),
+        vscode.workspace.registerTextDocumentContentProvider(REVISION_SCHEME, { provideTextDocumentContent: provideRevisionContent })
+    );
 
     // 4. Register Event Listeners
     // When editors are opened, switched, or split, blame the ones that just became visible
@@ -206,26 +227,34 @@ function blameDocument(document) {
     const requestId = ++blameRequestCounter;
     latestBlameRequest.set(document, requestId);
 
-    runGitBlame(document.uri.fsPath, document.getText(), (error, stdout, stderr) => {
+    // Look up the remote for "Open on GitHub" links alongside blame (cached per folder)
+    const remoteRepository = getRemoteRepository(path.dirname(document.uri.fsPath));
+
+    runGitBlame(document.uri.fsPath, document.getText(), async (error, stdout, stderr) => {
         // Skip stale results: a newer blame of this document has started, or blame was turned off
-        if (latestBlameRequest.get(document) !== requestId || !isBlameActive) {
+        const isStale = () => latestBlameRequest.get(document) !== requestId || !isBlameActive;
+        const editorsShowingDocument = () => vscode.window.visibleTextEditors.filter(editor => editor.document === document);
+        if (isStale()) {
             return;
         }
 
-        const editors = vscode.window.visibleTextEditors.filter(editor => editor.document === document);
-
         if (error) {
-            editors.forEach(editor => editor.setDecorations(blameDecorationType, []));
+            editorsShowingDocument().forEach(editor => editor.setDecorations(blameDecorationType, []));
             blameProblems.set(document, describeBlameError(document, error, stderr));
             updateStatusBar();
+            return;
+        }
+
+        const webRepository = await remoteRepository;
+        if (isStale()) {
             return;
         }
 
         blameProblems.delete(document);
         updateStatusBar();
 
-        const decorations = parseFullBlame(stdout, document);
-        editors.forEach(editor => editor.setDecorations(blameDecorationType, decorations));
+        const decorations = parseFullBlame(stdout, document, webRepository);
+        editorsShowingDocument().forEach(editor => editor.setDecorations(blameDecorationType, decorations));
     });
 }
 
@@ -263,7 +292,6 @@ function describeBlameError(document, error, stderr) {
 
 /**
  * Runs `git blame --porcelain` on the given text, as if it were the file's contents.
- * Output is streamed, so there is no size limit for large files.
  * @param {string} filePath Absolute file path.
  * @param {string} contents Current text of the file (may include unsaved edits).
  * @param {(error: Error|null, stdout: string, stderr: string) => void} callback Called once when git finishes.
@@ -272,9 +300,18 @@ function runGitBlame(filePath, contents, callback) {
     // Run git from the file's own directory so it resolves the nearest repository.
     // This handles submodules and workspaces opened through symlinks.
     // The text is passed on stdin (--contents -) so blame matches unsaved edits.
-    const git = spawn('git', ['blame', '--porcelain', '--contents', '-', '--', path.basename(filePath)], {
-        cwd: path.dirname(filePath),
-    });
+    runGit(['blame', '--porcelain', '--contents', '-', '--', path.basename(filePath)], path.dirname(filePath), contents, callback);
+}
+
+/**
+ * Runs a git command. Output is streamed, so there is no size limit for large files.
+ * @param {string[]} args Arguments for git.
+ * @param {string} cwd Folder to run git in.
+ * @param {string|undefined} input Text to pass on stdin, if any.
+ * @param {(error: Error|null, stdout: string, stderr: string) => void} callback Called once when git finishes.
+ */
+function runGit(args, cwd, input, callback) {
+    const git = spawn('git', args, { cwd });
 
     const stdout = [];
     const stderr = [];
@@ -291,21 +328,22 @@ function runGitBlame(filePath, contents, callback) {
     git.stderr.on('data', chunk => stderr.push(chunk));
     // Failed to start at all, e.g. git is not installed or the folder no longer exists
     git.on('error', finish);
-    git.on('close', code => finish(code === 0 ? null : new Error(`git blame exited with code ${code}`)));
+    git.on('close', code => finish(code === 0 ? null : new Error(`git ${args[0]} exited with code ${code}`)));
 
     // git can exit before reading all of stdin (e.g. outside a repository); ignore the resulting pipe error
     git.stdin.on('error', () => {});
-    git.stdin.end(contents);
+    git.stdin.end(input);
 }
 
 /**
  * Parses the full --porcelain output from git blame into decorations for the document.
  * @param {string} blameOutput The raw string output from the git blame command.
  * @param {vscode.TextDocument} document The document to which the blame applies.
+ * @param {WebRepository|null} webRepository Where commits can be opened on the web, if known.
  * @returns {vscode.DecorationOptions[]} An array of DecorationOptions.
  */
-function parseFullBlame(blameOutput, document) {
-    return buildDecorations(parseBlameLines(blameOutput, document.lineCount), document);
+function parseFullBlame(blameOutput, document, webRepository) {
+    return buildDecorations(parseBlameLines(blameOutput, document.lineCount), document, webRepository);
 }
 
 /**
@@ -352,9 +390,11 @@ function parseBlameLines(blameOutput, lineCount) {
  * Only the first line of a run of lines from the same commit is annotated; the rest are left blank.
  * @param {{ lineNumber: number, hash: string, commit: Record<string, string> }[]} entries
  * @param {vscode.TextDocument} document
+ * @param {WebRepository|null} webRepository
  * @returns {vscode.DecorationOptions[]}
  */
-function buildDecorations(entries, document) {
+function buildDecorations(entries, document, webRepository) {
+    const folder = path.dirname(document.uri.fsPath);
     const blamed = entries.filter(entry => entry.hash === UNCOMMITTED_HASH || (entry.commit.author && entry.commit['author-time']));
     const now = Date.now();
     const dateLabels = new Map(); // one relative age per commit instead of one per line
@@ -381,7 +421,7 @@ function buildDecorations(entries, document) {
         ].join(COLUMN_GAP);
 
         if (!hovers.has(entry.hash)) {
-            hovers.set(entry.hash, uncommitted ? uncommittedHover() : commitHover(entry.hash, entry.commit, now));
+            hovers.set(entry.hash, uncommitted ? uncommittedHover() : commitHover(entry.hash, entry.commit, now, folder, webRepository));
         }
 
         return {
@@ -472,20 +512,164 @@ function ageOpacity(authorTime, now) {
 }
 
 /**
+ * Builds the hover for a committed line: commit details plus links to copy the hash,
+ * show what the commit changed in this file, and open the commit on GitHub, GitLab or Bitbucket.
  * @param {string} hash Full commit hash.
  * @param {Record<string, string>} commit Commit details from the porcelain output.
  * @param {number} now Current time in milliseconds.
+ * @param {string} folder Folder of the blamed file, where git commands for the diff run.
+ * @param {WebRepository|null} webRepository Where commits can be opened on the web, if known.
  */
-function commitHover(hash, commit, now) {
-    const hoverMessage = new vscode.MarkdownString();
+function commitHover(hash, commit, now, folder, webRepository) {
+    const hoverMessage = new vscode.MarkdownString('', true);
+    // Only our own hover actions may run from links in this hover
+    hoverMessage.isTrusted = { enabledCommands: [COPY_HASH_COMMAND, SHOW_DIFF_COMMAND] };
     hoverMessage.appendCodeblock(commit.summary || 'No commit message.', 'text');
     hoverMessage.appendMarkdown(`\n\n**Commit:** ${hash}\n\n**Author:** ${commit.author} <${commit['author-mail']}>` +
         `\n\n**Date:** ${formatDate(commit['author-time'])} ${formatTime(commit['author-time'])} (${formatAge(commit['author-time'], now)})`);
+
+    const actions = [`[$(copy) Copy hash](${commandUri(COPY_HASH_COMMAND, hash)})`];
+    if (commit.filename) {
+        // "previous" is "<parent hash> <path in parent>"; it is missing when the commit added the file
+        const [previousHash, ...previousPath] = (commit.previous || '').split(' ');
+        const diff = {
+            folder,
+            hash,
+            path: unquoteGitPath(commit.filename),
+            previousHash: previousHash || null,
+            previousPath: previousHash ? unquoteGitPath(previousPath.join(' ')) : null,
+        };
+        actions.push(`[$(diff) Show diff](${commandUri(SHOW_DIFF_COMMAND, diff)})`);
+    }
+    if (webRepository) {
+        actions.push(`[$(link-external) Open on ${webRepository.name}](${webRepository.url}${webRepository.commitPath}${hash})`);
+    }
+    hoverMessage.appendMarkdown(`\n\n${actions.join(' · ')}`);
     return hoverMessage;
+}
+
+/**
+ * Decodes a path as git prints it in porcelain output. Paths with unusual characters are wrapped
+ * in quotes with C-style escapes, and non-ASCII bytes are written as octal (e.g. "caf\303\251.txt").
+ * @param {string} value
+ * @returns {string}
+ */
+function unquoteGitPath(value) {
+    if (value.length < 2 || !value.startsWith('"') || !value.endsWith('"')) {
+        return value;
+    }
+    const escapes = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 };
+    const inner = value.slice(1, -1);
+    const bytes = [];
+    for (let i = 0; i < inner.length; i++) {
+        if (inner[i] !== '\\') {
+            bytes.push(...Buffer.from(inner[i]));
+        } else if (/^[0-7]{3}$/.test(inner.slice(i + 1, i + 4))) {
+            bytes.push(parseInt(inner.slice(i + 1, i + 4), 8));
+            i += 3;
+        } else {
+            i++;
+            bytes.push(escapes[inner[i]] ?? inner.charCodeAt(i));
+        }
+    }
+    return Buffer.from(bytes).toString('utf8');
 }
 
 function uncommittedHover() {
     return new vscode.MarkdownString('**Uncommitted changes**\n\nThis line has not been committed yet.');
+}
+
+/**
+ * @param {string} command Command id.
+ * @param {...any} args Arguments passed to the command.
+ * @returns {string} A markdown link target that runs the command.
+ */
+function commandUri(command, ...args) {
+    // encodeURIComponent leaves ( and ) alone, but a ) would end the markdown link early (e.g. a file named "a (1).txt")
+    const query = encodeURIComponent(JSON.stringify(args)).replace(/\(/g, '%28').replace(/\)/g, '%29');
+    return `command:${command}?${query}`;
+}
+
+/**
+ * Hover action: copies a commit hash to the clipboard.
+ * @param {string} hash Full commit hash.
+ */
+async function copyCommitHash(hash) {
+    await vscode.env.clipboard.writeText(hash);
+    vscode.window.setStatusBarMessage(`$(check) Copied commit ${hash.substring(0, HASH_WIDTH)}`, 2000);
+}
+
+/**
+ * Hover action: shows what a commit changed in a file, as a diff of the file in the parent commit and in the commit.
+ * @param {{ folder: string, hash: string, path: string, previousHash: string|null, previousPath: string|null }} diff
+ *   Paths are relative to the repository root; previousHash is null when the commit added the file.
+ */
+async function showCommitDiff({ folder, hash, path: filePath, previousHash, previousPath }) {
+    const before = revisionUri(folder, previousPath || filePath, previousHash);
+    const after = revisionUri(folder, filePath, hash);
+    const title = `${path.basename(filePath)} (${hash.substring(0, HASH_WIDTH)})`;
+    await vscode.commands.executeCommand('vscode.diff', before, after, title);
+}
+
+/**
+ * @param {string} folder Folder inside the repository, where git runs.
+ * @param {string} filePath Path relative to the repository root.
+ * @param {string|null} ref Commit hash, or null for an empty document.
+ * @returns {vscode.Uri}
+ */
+function revisionUri(folder, filePath, ref) {
+    return vscode.Uri.from({ scheme: REVISION_SCHEME, path: `/${filePath}`, query: JSON.stringify({ folder, ref }) });
+}
+
+/**
+ * Supplies a file's contents at a commit for the diff view.
+ * @param {vscode.Uri} uri A URI built by revisionUri().
+ * @returns {Promise<string>}
+ */
+function provideRevisionContent(uri) {
+    const { folder, ref } = JSON.parse(uri.query);
+    if (!ref) {
+        return Promise.resolve('');
+    }
+    return new Promise(resolve => {
+        // In <commit>:<path>, the path is relative to the repository root
+        runGit(['show', `${ref}:${uri.path.replace(/^\//, '')}`], folder, undefined, (error, stdout) => resolve(error ? '' : stdout));
+    });
+}
+
+/**
+ * @typedef {{ name: string, url: string, commitPath: string }} WebRepository
+ *   A repository's web page: commits open at url + commitPath + hash.
+ */
+
+/**
+ * Finds the web page of the `origin` remote for a folder. Cached per folder.
+ * @param {string} folder
+ * @returns {Promise<WebRepository|null>}
+ */
+function getRemoteRepository(folder) {
+    if (!remoteRepositories.has(folder)) {
+        remoteRepositories.set(folder, new Promise(resolve => {
+            runGit(['remote', 'get-url', 'origin'], folder, undefined, (error, stdout) => resolve(error ? null : toWebRepository(stdout)));
+        }));
+    }
+    return remoteRepositories.get(folder);
+}
+
+/**
+ * Converts a git remote URL to its web repository, e.g. git@github.com:owner/repo.git -> https://github.com/owner/repo.
+ * Handles https://, ssh:// and scp-style (user@host:path) remotes; any credentials in the URL are dropped.
+ * @param {string} remote
+ * @returns {WebRepository|null} null for local paths and hosts without known commit pages.
+ */
+function toWebRepository(remote) {
+    const match = remote.trim().match(/^(?:[a-z][a-z+.-]*:\/\/)?(?:[^@/]+@)?([^/:]+)(?::\d+)?[:/](.+?)(?:\.git)?\/?$/i);
+    if (!match) {
+        return null;
+    }
+    const [, host, repositoryPath] = match;
+    const knownHost = WEB_HOSTS.find(candidate => host.toLowerCase().includes(candidate.match));
+    return knownHost ? { name: knownHost.name, url: `https://${host}/${repositoryPath}`, commitPath: knownHost.commitPath } : null;
 }
 
 function deactivate() {
