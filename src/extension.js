@@ -11,8 +11,10 @@ const UNCOMMITTED_HASH = '0'.repeat(40);
 let blameDecorationType;
 let blameStatusBarItem;
 let isBlameActive = false; // The master switch
-let editDebounceTimer;
-let latestBlameRequest = 0;
+let visibleEditors = new Set(); // Editors visible at the last change, to spot newly opened ones
+const editTimers = new Map(); // document -> pending re-blame after typing
+const latestBlameRequest = new Map(); // document -> id of its most recent blame run
+let blameRequestCounter = 0;
 
 function activate(context) {
     // 1. Create the Decoration Style
@@ -37,43 +39,57 @@ function activate(context) {
         updateStatusBar();
 
         if (isBlameActive) {
-            applyFullBlame(vscode.window.activeTextEditor);
+            visibleEditors = new Set(vscode.window.visibleTextEditors);
+            blameEditors(vscode.window.visibleTextEditors);
         } else {
-            clearTimeout(editDebounceTimer);
+            cancelPendingBlames();
             clearAllDecorations();
         }
     });
     context.subscriptions.push(toggleCommand);
 
     // 4. Register Event Listeners
-    // When the user switches to a different file
+    // When editors are opened, switched, or split, blame the ones that just became visible
     context.subscriptions.push(
-        vscode.window.onDidChangeActiveTextEditor(editor => {
+        vscode.window.onDidChangeVisibleTextEditors(editors => {
+            const newlyVisible = editors.filter(editor => !visibleEditors.has(editor));
+            visibleEditors = new Set(editors);
             if (isBlameActive) {
-                applyFullBlame(editor);
+                blameEditors(newlyVisible);
             }
         })
     );
 
-    // When the user saves the current file (blame info might have changed)
+    // When the user saves a visible file (blame info might have changed)
     context.subscriptions.push(
         vscode.workspace.onDidSaveTextDocument(document => {
-            const editor = vscode.window.activeTextEditor;
-            if (isBlameActive && editor && editor.document === document) {
-                applyFullBlame(editor);
+            if (isBlameActive && isVisible(document)) {
+                blameDocument(document);
             }
         })
     );
 
-    // When the user edits the current file, re-blame the unsaved text once typing pauses
+    // When the user edits a visible file, re-blame the unsaved text once typing pauses
     context.subscriptions.push(
         vscode.workspace.onDidChangeTextDocument(event => {
-            const editor = vscode.window.activeTextEditor;
-            if (!isBlameActive || !editor || editor.document !== event.document || event.contentChanges.length === 0) {
+            const document = event.document;
+            if (!isBlameActive || event.contentChanges.length === 0 || !isVisible(document)) {
                 return;
             }
-            clearTimeout(editDebounceTimer);
-            editDebounceTimer = setTimeout(() => applyFullBlame(editor, { showErrors: false }), EDIT_DEBOUNCE_MS);
+            clearTimeout(editTimers.get(document));
+            editTimers.set(document, setTimeout(() => {
+                editTimers.delete(document);
+                blameDocument(document, { showErrors: false });
+            }, EDIT_DEBOUNCE_MS));
+        })
+    );
+
+    // Forget per-document state when a file is closed
+    context.subscriptions.push(
+        vscode.workspace.onDidCloseTextDocument(document => {
+            clearTimeout(editTimers.get(document));
+            editTimers.delete(document);
+            latestBlameRequest.delete(document);
         })
     );
 
@@ -96,37 +112,63 @@ function updateStatusBar() {
 }
 
 /**
- * Clears all blame decorations from the active editor.
+ * Returns true if the document is shown in at least one visible editor.
+ * @param {vscode.TextDocument} document
+ */
+function isVisible(document) {
+    return vscode.window.visibleTextEditors.some(editor => editor.document === document);
+}
+
+/**
+ * Blames each distinct document shown in the given editors.
+ * @param {readonly vscode.TextEditor[]} editors
+ */
+function blameEditors(editors) {
+    new Set(editors.map(editor => editor.document)).forEach(document => blameDocument(document));
+}
+
+/**
+ * Cancels pending re-blames and makes any in-flight blame results stale.
+ */
+function cancelPendingBlames() {
+    editTimers.forEach(timer => clearTimeout(timer));
+    editTimers.clear();
+    latestBlameRequest.clear();
+}
+
+/**
+ * Clears blame decorations from every visible editor.
  */
 function clearAllDecorations() {
-    const editor = vscode.window.activeTextEditor;
-    if (editor) {
+    for (const editor of vscode.window.visibleTextEditors) {
         editor.setDecorations(blameDecorationType, []);
     }
 }
 
 /**
- * The core function to fetch and display blame for the ENTIRE file.
- * @param {vscode.TextEditor} editor The active text editor.
+ * Fetches blame for an entire document and shows it in every visible editor displaying it.
+ * @param {vscode.TextDocument} document The document to blame.
  * @param {{ showErrors?: boolean }} [options] Set showErrors to false to fail silently (e.g. while typing).
  */
-function applyFullBlame(editor, { showErrors = true } = {}) {
+function blameDocument(document, { showErrors = true } = {}) {
     // Only real files on disk can be blamed (skips untitled, output panels, diff views, etc.)
-    if (!editor || editor.document.uri.scheme !== 'file') {
+    if (document.uri.scheme !== 'file') {
         return;
     }
 
-    const document = editor.document;
-    const requestId = ++latestBlameRequest;
+    const requestId = ++blameRequestCounter;
+    latestBlameRequest.set(document, requestId);
 
     runGitBlame(document.uri.fsPath, document.getText(), (error, stdout, stderr) => {
-        // Skip stale results: a newer blame has started, blame was turned off, or the user moved on
-        if (requestId !== latestBlameRequest || !isBlameActive || vscode.window.activeTextEditor !== editor) {
+        // Skip stale results: a newer blame of this document has started, or blame was turned off
+        if (latestBlameRequest.get(document) !== requestId || !isBlameActive) {
             return;
         }
 
+        const editors = vscode.window.visibleTextEditors.filter(editor => editor.document === document);
+
         if (error) {
-            editor.setDecorations(blameDecorationType, []);
+            editors.forEach(editor => editor.setDecorations(blameDecorationType, []));
             if (showErrors) {
                 const msg = (stderr || error.message || '').trim();
                 vscode.window.showErrorMessage(`Blame failed: ${msg || 'Unknown error.'} Is the file committed?`);
@@ -135,7 +177,7 @@ function applyFullBlame(editor, { showErrors = true } = {}) {
         }
 
         const decorations = parseFullBlame(stdout, document);
-        editor.setDecorations(blameDecorationType, decorations);
+        editors.forEach(editor => editor.setDecorations(blameDecorationType, decorations));
     });
 }
 
@@ -257,7 +299,9 @@ function parseFullBlame(blameOutput, document) {
     return decorations;
 }
 
-function deactivate() {}
+function deactivate() {
+    cancelPendingBlames();
+}
 
 module.exports = {
     activate,
