@@ -342,7 +342,16 @@ function runGitBlame(filePath: string, contents: string, callback: GitCallback) 
     // Run git from the file's own directory so it resolves the nearest repository.
     // This handles submodules and workspaces opened through symlinks.
     // The text is passed on stdin (--contents -) so blame matches unsaved edits.
-    runGit(['blame', '--porcelain', '--contents', '-', '--', path.basename(filePath)], path.dirname(filePath), contents, callback);
+    const args = ['blame', '--porcelain', '--contents', '-', '--', path.basename(filePath)];
+    runGit(args, path.dirname(filePath), contents, (error, stdout, stderr) => {
+        // blame.ignoreRevsFile is often set globally but missing in some repos, which makes blame fail outright.
+        // Retry without the ignore list; a valid ignore-revs file is still respected on the first attempt.
+        if (error && /could not open object name list/i.test(stderr)) {
+            runGit(['blame', '--no-ignore-revs-file', ...args.slice(1)], path.dirname(filePath), contents, callback);
+            return;
+        }
+        callback(error, stdout, stderr);
+    });
 }
 
 /**
