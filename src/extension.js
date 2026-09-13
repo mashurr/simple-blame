@@ -12,10 +12,29 @@ const UNCOMMITTED_HASH = '0'.repeat(40);
 const HASH_WIDTH = 8;
 const MAX_AUTHOR_WIDTH = 20;
 const UNCOMMITTED_LABEL = 'uncommitted';
-const DATE_WIDTH = UNCOMMITTED_LABEL.length; // also fits YYYY-MM-DD
 // Columns are padded with non-breaking spaces; regular spaces collapse when rendered
 const NBSP = '\u00a0';
 const COLUMN_GAP = NBSP.repeat(2);
+
+// Units for the relative date column (e.g. "3 months ago"), largest first
+const DAY_SECONDS = 24 * 60 * 60;
+const AGE_UNITS = [
+    ['year', 365 * DAY_SECONDS],
+    ['month', 30 * DAY_SECONDS],
+    ['week', 7 * DAY_SECONDS],
+    ['day', DAY_SECONDS],
+    ['hour', 60 * 60],
+    ['minute', 60],
+];
+// Older commits fade so recent changes stand out: [age below this many seconds, opacity]
+const AGE_OPACITY = [
+    [7 * DAY_SECONDS, 0.9],
+    [30 * DAY_SECONDS, 0.82],
+    [182 * DAY_SECONDS, 0.75],
+    [365 * DAY_SECONDS, 0.68],
+    [2 * 365 * DAY_SECONDS, 0.62],
+    [Infinity, 0.55], // still readable on light and high-contrast themes
+];
 
 // --- Global State Variables ---
 let blameDecorationType;
@@ -337,9 +356,18 @@ function parseBlameLines(blameOutput, lineCount) {
  */
 function buildDecorations(entries, document) {
     const blamed = entries.filter(entry => entry.hash === UNCOMMITTED_HASH || (entry.commit.author && entry.commit['author-time']));
+    const now = Date.now();
+    const dateLabels = new Map(); // one relative age per commit instead of one per line
+    const dateLabel = entry => {
+        if (!dateLabels.has(entry.hash)) {
+            dateLabels.set(entry.hash, entry.hash === UNCOMMITTED_HASH ? UNCOMMITTED_LABEL : formatAge(entry.commit['author-time'], now));
+        }
+        return dateLabels.get(entry.hash);
+    };
     const authorWidth = Math.min(MAX_AUTHOR_WIDTH, blamed.reduce((width, entry) => Math.max(width, charCount(authorOf(entry))), 0));
+    const dateWidth = blamed.reduce((width, entry) => Math.max(width, charCount(dateLabel(entry))), 0);
     // Blank lines inside a block still get an annotation of the same width, or their code would shift left
-    const blankAnnotation = NBSP.repeat(HASH_WIDTH + authorWidth + DATE_WIDTH + 2 * COLUMN_GAP.length);
+    const blankAnnotation = NBSP.repeat(HASH_WIDTH + authorWidth + dateWidth + 2 * COLUMN_GAP.length);
     const hovers = new Map(); // one hover per commit instead of one per line
 
     return blamed.map((entry, index) => {
@@ -349,18 +377,20 @@ function buildDecorations(entries, document) {
         const contentText = continuesBlock ? blankAnnotation : [
             padColumn(uncommitted ? '' : entry.hash.substring(0, HASH_WIDTH), HASH_WIDTH),
             padColumn(authorOf(entry), authorWidth),
-            padColumn(uncommitted ? UNCOMMITTED_LABEL : formatDate(entry.commit['author-time']), DATE_WIDTH),
+            padColumn(dateLabel(entry), dateWidth),
         ].join(COLUMN_GAP);
 
         if (!hovers.has(entry.hash)) {
-            hovers.set(entry.hash, uncommitted ? uncommittedHover() : commitHover(entry.hash, entry.commit));
+            hovers.set(entry.hash, uncommitted ? uncommittedHover() : commitHover(entry.hash, entry.commit, now));
         }
 
         return {
             range: document.lineAt(entry.lineNumber).range,
             renderOptions: {
-                // Uncommitted lines are dimmed so real commits stand out
-                before: uncommitted ? { contentText, color: new vscode.ThemeColor('disabledForeground') } : { contentText },
+                // Uncommitted lines are dimmed; committed ones fade with age so recent changes stand out
+                before: uncommitted
+                    ? { contentText, color: new vscode.ThemeColor('disabledForeground') }
+                    : { contentText, textDecoration: `none; opacity: ${ageOpacity(entry.commit['author-time'], now)};` },
             },
             hoverMessage: hovers.get(entry.hash),
         };
@@ -407,13 +437,50 @@ function formatDate(authorTime) {
 }
 
 /**
+ * @param {string} authorTime Unix timestamp in seconds.
+ * @returns {string} The time as HH:MM.
+ */
+function formatTime(authorTime) {
+    const date = new Date(parseInt(authorTime, 10) * 1000);
+    return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
+}
+
+/**
+ * @param {string} authorTime Unix timestamp in seconds.
+ * @param {number} now Current time in milliseconds.
+ * @returns {string} How long ago, e.g. "3 months ago", or "just now" for under a minute (or a clock ahead of ours).
+ */
+function formatAge(authorTime, now) {
+    const elapsed = now / 1000 - parseInt(authorTime, 10);
+    for (const [unit, seconds] of AGE_UNITS) {
+        if (elapsed >= seconds) {
+            const count = Math.floor(elapsed / seconds);
+            return `${count} ${unit}${count === 1 ? '' : 's'} ago`;
+        }
+    }
+    return 'just now';
+}
+
+/**
+ * @param {string} authorTime Unix timestamp in seconds.
+ * @param {number} now Current time in milliseconds.
+ * @returns {number} Annotation opacity, lower for older commits.
+ */
+function ageOpacity(authorTime, now) {
+    const elapsed = now / 1000 - parseInt(authorTime, 10);
+    return AGE_OPACITY.find(([maxAge]) => elapsed < maxAge)[1];
+}
+
+/**
  * @param {string} hash Full commit hash.
  * @param {Record<string, string>} commit Commit details from the porcelain output.
+ * @param {number} now Current time in milliseconds.
  */
-function commitHover(hash, commit) {
+function commitHover(hash, commit, now) {
     const hoverMessage = new vscode.MarkdownString();
     hoverMessage.appendCodeblock(commit.summary || 'No commit message.', 'text');
-    hoverMessage.appendMarkdown(`\n\n**Commit:** ${hash}\n\n**Author:** ${commit.author} <${commit['author-mail']}>`);
+    hoverMessage.appendMarkdown(`\n\n**Commit:** ${hash}\n\n**Author:** ${commit.author} <${commit['author-mail']}>` +
+        `\n\n**Date:** ${formatDate(commit['author-time'])} ${formatTime(commit['author-time'])} (${formatAge(commit['author-time'], now)})`);
     return hoverMessage;
 }
 
