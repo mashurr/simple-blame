@@ -330,6 +330,7 @@ function parseBlameLines(blameOutput, lineCount) {
 /**
  * Builds a decoration for each blamed line. Every annotation is padded to the same width
  * (hash, author, date columns) so the code after it stays aligned.
+ * Only the first line of a run of lines from the same commit is annotated; the rest are left blank.
  * @param {{ lineNumber: number, hash: string, commit: Record<string, string> }[]} entries
  * @param {vscode.TextDocument} document
  * @returns {vscode.DecorationOptions[]}
@@ -337,11 +338,15 @@ function parseBlameLines(blameOutput, lineCount) {
 function buildDecorations(entries, document) {
     const blamed = entries.filter(entry => entry.hash === UNCOMMITTED_HASH || (entry.commit.author && entry.commit['author-time']));
     const authorWidth = Math.min(MAX_AUTHOR_WIDTH, blamed.reduce((width, entry) => Math.max(width, charCount(authorOf(entry))), 0));
+    // Blank lines inside a block still get an annotation of the same width, or their code would shift left
+    const blankAnnotation = NBSP.repeat(HASH_WIDTH + authorWidth + DATE_WIDTH + 2 * COLUMN_GAP.length);
     const hovers = new Map(); // one hover per commit instead of one per line
 
-    return blamed.map(entry => {
+    return blamed.map((entry, index) => {
         const uncommitted = entry.hash === UNCOMMITTED_HASH;
-        const contentText = [
+        const previous = blamed[index - 1];
+        const continuesBlock = previous && previous.hash === entry.hash && previous.lineNumber === entry.lineNumber - 1;
+        const contentText = continuesBlock ? blankAnnotation : [
             padColumn(uncommitted ? '' : entry.hash.substring(0, HASH_WIDTH), HASH_WIDTH),
             padColumn(authorOf(entry), authorWidth),
             padColumn(uncommitted ? UNCOMMITTED_LABEL : formatDate(entry.commit['author-time']), DATE_WIDTH),
