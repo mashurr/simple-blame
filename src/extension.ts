@@ -255,10 +255,13 @@ function blameDocument(document: vscode.TextDocument) {
     const requestId = ++blameRequestCounter;
     latestBlameRequest.set(document, requestId);
 
-    // Look up the remote for "Open on GitHub" links alongside blame (cached per folder)
-    const remoteRepository = getRemoteRepository(path.dirname(document.uri.fsPath));
+    // A symlinked file is blamed as its target: git stores the link itself as just a path
+    const filePath = resolveSymlinks(document.uri.fsPath);
 
-    runGitBlame(document.uri.fsPath, document.getText(), async (error, stdout, stderr) => {
+    // Look up the remote for "Open on GitHub" links alongside blame (cached per folder)
+    const remoteRepository = getRemoteRepository(path.dirname(filePath));
+
+    runGitBlame(filePath, document.getText(), async (error, stdout, stderr) => {
         // Skip stale results: a newer blame of this document has started, or blame was turned off
         const isStale = () => latestBlameRequest.get(document) !== requestId || !isBlameActive;
         const editorsShowingDocument = () => vscode.window.visibleTextEditors.filter(editor => editor.document === document);
@@ -281,7 +284,7 @@ function blameDocument(document: vscode.TextDocument) {
         blameProblems.delete(document);
         updateStatusBar();
 
-        const decorations = parseFullBlame(stdout, document, webRepository);
+        const decorations = parseFullBlame(stdout, document, path.dirname(filePath), webRepository);
         editorsShowingDocument().forEach(editor => editor.setDecorations(blameDecorationType, decorations));
     });
 }
@@ -315,6 +318,18 @@ function describeBlameError(document: vscode.TextDocument, error: GitError, stde
         return 'Repository has no commits yet';
     }
     return (stderr.trim().split('\n')[0] || error.message).replace(/^fatal: /, '');
+}
+
+/**
+ * Returns the file's real path with symlinks resolved, or the path unchanged if it can't be resolved
+ * (for example when the file was deleted from disk while still open).
+ */
+function resolveSymlinks(filePath: string): string {
+    try {
+        return fs.realpathSync(filePath);
+    } catch {
+        return filePath;
+    }
 }
 
 /**
@@ -366,10 +381,11 @@ function runGit(args: string[], cwd: string, input: string | undefined, callback
  * Parses the full --porcelain output from git blame into decorations for the document.
  * @param blameOutput The raw string output from the git blame command.
  * @param document The document to which the blame applies.
+ * @param folder Folder git ran in (the real location of the file), used by the Show diff action.
  * @param webRepository Where commits can be opened on the web, if known.
  */
-function parseFullBlame(blameOutput: string, document: vscode.TextDocument, webRepository: WebRepository | null): vscode.DecorationOptions[] {
-    return buildDecorations(parseBlameLines(blameOutput, document.lineCount), document, webRepository);
+function parseFullBlame(blameOutput: string, document: vscode.TextDocument, folder: string, webRepository: WebRepository | null): vscode.DecorationOptions[] {
+    return buildDecorations(parseBlameLines(blameOutput, document.lineCount), document, folder, webRepository);
 }
 
 /**
@@ -414,8 +430,7 @@ function parseBlameLines(blameOutput: string, lineCount: number): BlameEntry[] {
  * (hash, author, date columns) so the code after it stays aligned.
  * Only the first line of a run of lines from the same commit is annotated; the rest are left blank.
  */
-function buildDecorations(entries: BlameEntry[], document: vscode.TextDocument, webRepository: WebRepository | null): vscode.DecorationOptions[] {
-    const folder = path.dirname(document.uri.fsPath);
+function buildDecorations(entries: BlameEntry[], document: vscode.TextDocument, folder: string, webRepository: WebRepository | null): vscode.DecorationOptions[] {
     const blamed = entries.filter(entry => entry.hash === UNCOMMITTED_HASH || (entry.commit.author && entry.commit['author-time']));
     const now = Date.now();
     const dateLabels = new Map<string, string>(); // one relative age per commit instead of one per line
