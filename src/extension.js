@@ -1,5 +1,6 @@
 const vscode = require('vscode');
 const { spawn } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 
 // How long to wait after the last edit before re-running blame
@@ -14,7 +15,9 @@ let isBlameActive = false; // The master switch
 let visibleEditors = new Set(); // Editors visible at the last change, to spot newly opened ones
 const editTimers = new Map(); // document -> pending re-blame after typing
 const latestBlameRequest = new Map(); // document -> id of its most recent blame run
+const blameProblems = new Map(); // document -> why blame is unavailable, shown in the status bar
 let blameRequestCounter = 0;
+let gitMissingReported = false; // Only tell the user once that git is missing
 
 function activate(context) {
     // 1. Create the Decoration Style
@@ -36,7 +39,6 @@ function activate(context) {
     // 3. Register the Toggle Command
     const toggleCommand = vscode.commands.registerCommand('simple-blame.toggle', () => {
         isBlameActive = !isBlameActive;
-        updateStatusBar();
 
         if (isBlameActive) {
             visibleEditors = new Set(vscode.window.visibleTextEditors);
@@ -44,7 +46,9 @@ function activate(context) {
         } else {
             cancelPendingBlames();
             clearAllDecorations();
+            blameProblems.clear();
         }
+        updateStatusBar();
     });
     context.subscriptions.push(toggleCommand);
 
@@ -58,6 +62,11 @@ function activate(context) {
                 blameEditors(newlyVisible);
             }
         })
+    );
+
+    // When focus moves to another editor, show that file's blame status
+    context.subscriptions.push(
+        vscode.window.onDidChangeActiveTextEditor(() => updateStatusBar())
     );
 
     // When the user saves a visible file (blame info might have changed)
@@ -79,7 +88,7 @@ function activate(context) {
             clearTimeout(editTimers.get(document));
             editTimers.set(document, setTimeout(() => {
                 editTimers.delete(document);
-                blameDocument(document, { showErrors: false });
+                blameDocument(document);
             }, EDIT_DEBOUNCE_MS));
         })
     );
@@ -90,6 +99,7 @@ function activate(context) {
             clearTimeout(editTimers.get(document));
             editTimers.delete(document);
             latestBlameRequest.delete(document);
+            blameProblems.delete(document);
         })
     );
 
@@ -100,14 +110,23 @@ function activate(context) {
 
 /**
  * Updates the text and tooltip of the status bar item.
+ * While blame is on, it also explains why blame is unavailable for the focused file, if it is.
  */
 function updateStatusBar() {
-    if (isBlameActive) {
-        blameStatusBarItem.text = `$(git-commit) Blame: ON`;
-        blameStatusBarItem.tooltip = "Click to hide blame for the whole file";
-    } else {
+    if (!isBlameActive) {
         blameStatusBarItem.text = `$(git-commit) Blame: OFF`;
         blameStatusBarItem.tooltip = "Click to show blame for the whole file";
+        return;
+    }
+
+    const editor = vscode.window.activeTextEditor;
+    const problem = editor && blameProblems.get(editor.document);
+    if (problem) {
+        blameStatusBarItem.text = `$(git-commit) Blame: ON $(info)`;
+        blameStatusBarItem.tooltip = `Blame unavailable: ${problem}. Click to hide blame.`;
+    } else {
+        blameStatusBarItem.text = `$(git-commit) Blame: ON`;
+        blameStatusBarItem.tooltip = "Click to hide blame for the whole file";
     }
 }
 
@@ -147,10 +166,10 @@ function clearAllDecorations() {
 
 /**
  * Fetches blame for an entire document and shows it in every visible editor displaying it.
+ * Problems (e.g. an untracked file) are reported quietly in the status bar instead of pop-ups.
  * @param {vscode.TextDocument} document The document to blame.
- * @param {{ showErrors?: boolean }} [options] Set showErrors to false to fail silently (e.g. while typing).
  */
-function blameDocument(document, { showErrors = true } = {}) {
+function blameDocument(document) {
     // Only real files on disk can be blamed (skips untitled, output panels, diff views, etc.)
     if (document.uri.scheme !== 'file') {
         return;
@@ -169,16 +188,49 @@ function blameDocument(document, { showErrors = true } = {}) {
 
         if (error) {
             editors.forEach(editor => editor.setDecorations(blameDecorationType, []));
-            if (showErrors) {
-                const msg = (stderr || error.message || '').trim();
-                vscode.window.showErrorMessage(`Blame failed: ${msg || 'Unknown error.'} Is the file committed?`);
-            }
+            blameProblems.set(document, describeBlameError(document, error, stderr));
+            updateStatusBar();
             return;
         }
+
+        blameProblems.delete(document);
+        updateStatusBar();
 
         const decorations = parseFullBlame(stdout, document);
         editors.forEach(editor => editor.setDecorations(blameDecorationType, decorations));
     });
+}
+
+/**
+ * Turns a failed git blame into a short, human-readable reason for the status bar.
+ * A missing git installation is the one real problem, so it also gets a one-time error message.
+ * @param {vscode.TextDocument} document The document that failed to blame.
+ * @param {Error & { code?: string }} error The error from running git.
+ * @param {string} stderr git's error output.
+ * @returns {string}
+ */
+function describeBlameError(document, error, stderr) {
+    if (error.code === 'ENOENT') {
+        // spawn reports ENOENT both when git is missing and when the file's folder is gone
+        if (!fs.existsSync(path.dirname(document.uri.fsPath))) {
+            return 'File no longer exists on disk';
+        }
+        if (!gitMissingReported) {
+            gitMissingReported = true;
+            vscode.window.showErrorMessage('Simple Blame: Git was not found. Install Git and make sure it is on your PATH.');
+        }
+        return 'Git was not found';
+    }
+    if (/not a git repository/i.test(stderr)) {
+        return 'Not in a Git repository';
+    }
+    if (/no such path .* in HEAD/i.test(stderr)) {
+        return 'File is not committed yet';
+    }
+    if (/no such ref: HEAD|bad revision 'HEAD'/i.test(stderr)) {
+        return 'Repository has no commits yet';
+    }
+    return (stderr.trim().split('\n')[0] || error.message).replace(/^fatal: /, '');
 }
 
 /**
