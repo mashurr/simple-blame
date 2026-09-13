@@ -2,7 +2,7 @@
     "name": "simple-blame",
     "displayName": "Simple Blame",
     "description": "A simple extension to toggle a whole-file Git blame view.",
-    "version": "0.0.4",
+    "version": "1.0.0",
     "publisher": "mashurr",
     "icon": "icon.png",
     "repository": {
@@ -15,8 +15,17 @@
     "categories": [
         "Other"
     ],
-    "activationEvents": [],
-    "main": "./src/extension.js",
+    "keywords": [
+        "git",
+        "blame",
+        "annotations",
+        "inline blame",
+        "history"
+    ],
+    "activationEvents": [
+        "onStartupFinished"
+    ],
+    "main": "./out/extension.js",
     "contributes": {
         "commands": [
             {
@@ -26,17 +35,17 @@
         ]
     },
     "scripts": {
-        "lint": "eslint .",
-        "pretest": "npm run lint",
-        "test": "vscode-test"
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./",
+        "lint": "eslint src"
     },
     "devDependencies": {
-        "@types/mocha": "^10.0.10",
         "@types/node": "20.x",
         "@types/vscode": "^1.90.0",
-        "@vscode/test-cli": "^0.0.15",
-        "@vscode/test-electron": "^2.5.2",
-        "eslint": "^9.25.1"
+        "eslint": "^9.25.1",
+        "typescript": "^6.0.3",
+        "typescript-eslint": "^8.70.0"
     },
     "license": "MIT"
 }
