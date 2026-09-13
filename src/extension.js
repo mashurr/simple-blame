@@ -1,11 +1,16 @@
 const vscode = require('vscode');
-const { execFile } = require('child_process');
+const { spawn } = require('child_process');
 const path = require('path');
+
+// How long to wait after the last edit before re-running blame
+const EDIT_DEBOUNCE_MS = 300;
 
 // --- Global State Variables ---
 let blameDecorationType;
 let blameStatusBarItem;
 let isBlameActive = false; // The master switch
+let editDebounceTimer;
+let latestBlameRequest = 0;
 
 function activate(context) {
     // 1. Create the Decoration Style
@@ -32,6 +37,7 @@ function activate(context) {
         if (isBlameActive) {
             applyFullBlame(vscode.window.activeTextEditor);
         } else {
+            clearTimeout(editDebounceTimer);
             clearAllDecorations();
         }
     });
@@ -54,6 +60,18 @@ function activate(context) {
             if (isBlameActive && editor && editor.document === document) {
                 applyFullBlame(editor);
             }
+        })
+    );
+
+    // When the user edits the current file, re-blame the unsaved text once typing pauses
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeTextDocument(event => {
+            const editor = vscode.window.activeTextEditor;
+            if (!isBlameActive || !editor || editor.document !== event.document || event.contentChanges.length === 0) {
+                return;
+            }
+            clearTimeout(editDebounceTimer);
+            editDebounceTimer = setTimeout(() => applyFullBlame(editor, { showErrors: false }), EDIT_DEBOUNCE_MS);
         })
     );
 
@@ -88,33 +106,72 @@ function clearAllDecorations() {
 /**
  * The core function to fetch and display blame for the ENTIRE file.
  * @param {vscode.TextEditor} editor The active text editor.
+ * @param {{ showErrors?: boolean }} [options] Set showErrors to false to fail silently (e.g. while typing).
  */
-function applyFullBlame(editor) {
+function applyFullBlame(editor, { showErrors = true } = {}) {
     // Only real files on disk can be blamed (skips untitled, output panels, diff views, etc.)
     if (!editor || editor.document.uri.scheme !== 'file') {
         return;
     }
 
-    clearAllDecorations();
+    const document = editor.document;
+    const requestId = ++latestBlameRequest;
 
-    const filePath = editor.document.uri.fsPath;
+    runGitBlame(document.uri.fsPath, document.getText(), (error, stdout, stderr) => {
+        // Skip stale results: a newer blame has started, blame was turned off, or the user moved on
+        if (requestId !== latestBlameRequest || !isBlameActive || vscode.window.activeTextEditor !== editor) {
+            return;
+        }
 
-    // Run git from the file's own directory so it resolves the nearest repository.
-    // This handles submodules and workspaces opened through symlinks.
-    execFile('git', ['blame', '--porcelain', '--', path.basename(filePath)], { cwd: path.dirname(filePath) }, (error, stdout, stderr) => {
         if (error) {
-            const msg = (stderr || error.message || '').toString().trim();
-            vscode.window.showErrorMessage(`Blame failed: ${msg || 'Unknown error.'} Is the file committed?`);
+            editor.setDecorations(blameDecorationType, []);
+            if (showErrors) {
+                const msg = (stderr || error.message || '').trim();
+                vscode.window.showErrorMessage(`Blame failed: ${msg || 'Unknown error.'} Is the file committed?`);
+            }
             return;
         }
 
-        if (!isBlameActive || vscode.window.activeTextEditor !== editor) {
-            return;
-        }
-
-        const decorations = parseFullBlame(stdout.toString(), editor.document);
+        const decorations = parseFullBlame(stdout, document);
         editor.setDecorations(blameDecorationType, decorations);
     });
+}
+
+/**
+ * Runs `git blame --porcelain` on the given text, as if it were the file's contents.
+ * Output is streamed, so there is no size limit for large files.
+ * @param {string} filePath Absolute file path.
+ * @param {string} contents Current text of the file (may include unsaved edits).
+ * @param {(error: Error|null, stdout: string, stderr: string) => void} callback Called once when git finishes.
+ */
+function runGitBlame(filePath, contents, callback) {
+    // Run git from the file's own directory so it resolves the nearest repository.
+    // This handles submodules and workspaces opened through symlinks.
+    // The text is passed on stdin (--contents -) so blame matches unsaved edits.
+    const git = spawn('git', ['blame', '--porcelain', '--contents', '-', '--', path.basename(filePath)], {
+        cwd: path.dirname(filePath),
+    });
+
+    const stdout = [];
+    const stderr = [];
+    let finished = false;
+    const finish = (error) => {
+        if (finished) {
+            return;
+        }
+        finished = true;
+        callback(error, Buffer.concat(stdout).toString(), Buffer.concat(stderr).toString());
+    };
+
+    git.stdout.on('data', chunk => stdout.push(chunk));
+    git.stderr.on('data', chunk => stderr.push(chunk));
+    // Failed to start at all, e.g. git is not installed or the folder no longer exists
+    git.on('error', finish);
+    git.on('close', code => finish(code === 0 ? null : new Error(`git blame exited with code ${code}`)));
+
+    // git can exit before reading all of stdin (e.g. outside a repository); ignore the resulting pipe error
+    git.stdin.on('error', () => {});
+    git.stdin.end(contents);
 }
 
 /**
