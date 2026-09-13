@@ -2,7 +2,7 @@
     "name": "simple-blame",
     "displayName": "Simple Blame",
     "description": "A simple extension to toggle a whole-file Git blame view.",
-    "version": "0.0.4",
+    "version": "1.0.0",
     "publisher": "mashurr",
     "icon": "icon.png",
     "repository": {
@@ -14,6 +14,13 @@
     },
     "categories": [
         "Other"
+    ],
+    "keywords": [
+        "git",
+        "blame",
+        "annotations",
+        "inline blame",
+        "history"
     ],
     "activationEvents": [
         "onStartupFinished"
