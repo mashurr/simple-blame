@@ -4,6 +4,8 @@ const path = require('path');
 
 // How long to wait after the last edit before re-running blame
 const EDIT_DEBOUNCE_MS = 300;
+// git blame uses this hash for lines that are not committed yet
+const UNCOMMITTED_HASH = '0'.repeat(40);
 
 // --- Global State Variables ---
 let blameDecorationType;
@@ -194,7 +196,15 @@ function parseFullBlame(blameOutput, document) {
         try {
             if (line.startsWith('\t')) {
                 // This is the line of code. We must have seen its metadata already.
-                if (currentCommitHash && currentLineNumber >= 0 && currentLineNumber < document.lineCount) {
+                if (currentCommitHash === UNCOMMITTED_HASH && currentLineNumber >= 0 && currentLineNumber < document.lineCount) {
+                    // git reports lines that aren't committed yet with an all-zero hash and a placeholder author
+                    const hoverMessage = new vscode.MarkdownString('**Uncommitted changes**\n\nThis line has not been committed yet.');
+                    decorations.push({
+                        range: document.lineAt(currentLineNumber).range,
+                        renderOptions: { before: { contentText: 'You · uncommitted', color: new vscode.ThemeColor('disabledForeground') } },
+                        hoverMessage
+                    });
+                } else if (currentCommitHash && currentLineNumber >= 0 && currentLineNumber < document.lineCount) {
                     const commitInfo = commitDataCache.get(currentCommitHash);
 
                     // If we have valid, cached info for this commit, create the decoration
