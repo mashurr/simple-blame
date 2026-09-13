@@ -7,8 +7,7 @@
             "ES2022"
         ],
         "types": [
-            "node",
-            "mocha"
+            "node"
         ],
         "sourceMap": true,
         "rootDir": "src",
