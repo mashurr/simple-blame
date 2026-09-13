@@ -1,9 +1,20 @@
 # Change Log
 
-All notable changes to the "simple-blame" extension will be documented in this file.
+## [0.0.4]
 
-Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
+- Blame now works for files inside Git submodules.
+- Fixed blame for workspaces opened through a symlink.
+- Fixed blame for file paths containing quotes or `$`.
+- No more error pop-ups for non-file editors such as output panels.
 
-## [Unreleased]
+## [0.0.3]
 
-- Initial release
+- Lowered the minimum VS Code version to 1.90.
+
+## [0.0.2]
+
+- Added extension icon.
+
+## [0.0.1]
+
+- Initial release: whole-file blame toggle, status bar button, and hover details.
